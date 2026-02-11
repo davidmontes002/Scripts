@@ -21,11 +21,6 @@ function validar_ip() {
     return 1
 }
 
-function en_red() {
-    local ip=$1
-    [[ $ip == 192.168.100.* ]]
-}
-
 function es_broadcast_o_red() {
     local ip=$1
     IFS='.' read -r -a oct <<< "$ip"
@@ -36,6 +31,39 @@ function ip_a_num() {
     local ip=$1
     IFS='.' read -r -a oct <<< "$ip"
     echo $(( (${oct[0]} << 24) + (${oct[1]} << 16) + (${oct[2]} << 8) + ${oct[3]} ))
+}
+
+# ==============================
+# Estado de instalación DHCP
+# ==============================
+function Estado_Instalacion() {
+    echo
+    echo "=== ESTADO DE INSTALACION DHCP ==="
+    if dpkg -l | grep -q isc-dhcp-server; then
+        echo "[+] El paquete isc-dhcp-server está instalado."
+    else
+        echo "[-] El paquete isc-dhcp-server NO está instalado."
+    fi
+    echo
+    read -p "Presiona Enter para regresar al menu..."
+}
+
+# ==============================
+# Instalación silenciosa DHCP
+# ==============================
+function Instalar_Silencioso() {
+    echo
+    echo "=== INSTALACION SILENCIOSA DHCP ==="
+    if dpkg -l | grep -q isc-dhcp-server; then
+        echo "[+] DHCP Server ya está instalado."
+    else
+        echo "[+] Instalando isc-dhcp-server en modo silencioso..."
+        sudo apt-get update -qq
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y isc-dhcp-server >/dev/null 2>&1
+        echo "[+] Instalación completada."
+    fi
+    echo
+    read -p "Presiona Enter para regresar al menu..."
 }
 
 # ==============================
@@ -68,8 +96,8 @@ function Configurar_DHCP() {
     read -p "Nombre de la interfaz de red interna (ej: enp0s8): " IFACE
 
     read -p "IP del servidor DHCP (ej: 192.168.100.1): " IP_SERVER
-    while ! validar_ip $IP_SERVER || ! en_red $IP_SERVER; do
-        echo "Error: IP no valida o fuera de la red interna."
+    while ! validar_ip $IP_SERVER; do
+        echo "Error: IP no valida."
         read -p "Ingresa IP valida: " IP_SERVER
     done
 
@@ -101,18 +129,11 @@ EOF
 
     read -p "Nombre del Scope: " SCOPE_NAME
 
-    MIN_IP="192.168.100.50"
-    MAX_IP="192.168.100.150"
-
     # IP Inicial
     while true; do
-        read -p "IP inicial del rango (>= $MIN_IP): " START_IP
+        read -p "IP inicial del rango DHCP: " START_IP
         if ! validar_ip $START_IP; then
             echo "Error: IP invalida"
-        elif ! en_red $START_IP; then
-            echo "Error: IP fuera de la red interna"
-        elif (( $(ip_a_num $START_IP) < $(ip_a_num $MIN_IP) )); then
-            echo "Error: IP menor que $MIN_IP"
         elif es_broadcast_o_red $START_IP; then
             echo "Error: IP no puede ser .0 o .255"
         else
@@ -122,13 +143,9 @@ EOF
 
     # IP Final
     while true; do
-        read -p "IP final del rango (<= $MAX_IP): " END_IP
+        read -p "IP final del rango DHCP: " END_IP
         if ! validar_ip $END_IP; then
             echo "Error: IP invalida"
-        elif ! en_red $END_IP; then
-            echo "Error: IP fuera de la red interna"
-        elif (( $(ip_a_num $END_IP) > $(ip_a_num $MAX_IP) )); then
-            echo "Error: IP mayor que $MAX_IP"
         elif (( $(ip_a_num $END_IP) <= $(ip_a_num $START_IP) )); then
             echo "Error: IP final debe ser mayor que la inicial"
         elif es_broadcast_o_red $END_IP; then
@@ -138,56 +155,64 @@ EOF
         fi
     done
 
-    # Gateway
-    while true; do
-        read -p "Gateway: " GATEWAY
-        if ! validar_ip $GATEWAY; then
+    # Gateway (opcional)
+    read -p "Gateway (opcional, Enter para omitir): " GW
+    if [[ -n "$GW" ]]; then
+        while ! validar_ip $GW; do
             echo "Error: IP invalida"
-        elif ! en_red $GATEWAY; then
-            echo "Error: Gateway fuera de la red interna"
-        elif [[ "$GATEWAY" == "$IP_SERVER" ]]; then
-            echo "Error: Gateway no puede ser la misma IP que el servidor"
-        else
-            break
-        fi
+            read -p "Ingresa IP Gateway valida o Enter para omitir: " GW
+            [[ -z "$GW" ]] && break
+        done
+    fi
+
+    # DNS (opcional)
+    read -p "DNS (opcional, Enter para omitir): " DNS
+    if [[ -n "$DNS" ]]; then
+        while ! validar_ip $DNS; do
+            echo "Error: IP invalida"
+            read -p "Ingresa IP DNS valida o Enter para omitir: " DNS
+            [[ -z "$DNS" ]] && break
+        done
+    fi
+
+    # Tiempo de concesion
+    read -p "Tiempo de concesion (en minutos): " LEASE
+    while ! [[ $LEASE =~ ^[0-9]+$ ]] || (( LEASE <= 0 )); do
+        echo "Error: Ingresa un numero valido"
+        read -p "Tiempo de concesion (en minutos): " LEASE
     done
 
-    # DNS
-    while true; do
-        read -p "DNS: " DNS
-        if ! validar_ip $DNS; then
-            echo "Error: IP inválida"
-        elif [[ "$DNS" == "0.0.0.0" ]]; then
-            echo "Error: DNS no puede ser 0.0.0.0"
-        else
-            break
-        fi
-    done
+    # Crear dhcpd.conf con el nuevo formato
+    NET="${START_IP%.*}"
+    RANGO_INI="$START_IP"
+    IP_FIN="$END_IP"
 
-    # Tiempo de concesión
-    while true; do
-        read -p "Tiempo de concesion (en minutos): " LEASE_MIN
-        if ! [[ $LEASE_MIN =~ ^[0-9]+$ ]] || (( LEASE_MIN <= 0 )); then
-            echo "Error: Ingresa un numero valido"
-        else
-            break
-        fi
-    done
-
-    # Crear dhcpd.conf
-    sudo tee /etc/dhcp/dhcpd.conf >/dev/null <<EOF
-default-lease-time $((LEASE_MIN*60));
-max-lease-time $((LEASE_MIN*120));
-
-subnet 192.168.100.0 netmask 255.255.255.0 {
-  range $START_IP $END_IP;
-  option routers $GATEWAY;
-  option domain-name-servers $DNS;
+    cat <<EOF | sudo tee /etc/dhcp/dhcpd.conf > /dev/null
+subnet $NET.0 netmask 255.255.255.0 {
+  range $RANGO_INI $IP_FIN;
+  option subnet-mask 255.255.255.0;
+  ${GW:+option routers $GW;}
+  ${DNS:+option domain-name-servers $DNS;}
+  default-lease-time $((LEASE*60));
+  max-lease-time $((LEASE*60));
 }
 EOF
 
+    echo "Configuración completada."
+    read -p "Presiona Enter para regresar al menu..."
+}
+
+
+# ==============================
+# Iniciar / Reiniciar DHCP
+# ==============================
+function Iniciar_DHCP() {
+    echo
+    echo "=== INICIANDO / REINICIANDO SERVICIO DHCP ==="
+    sudo systemctl enable isc-dhcp-server
     sudo systemctl restart isc-dhcp-server
-    echo "DHCP configurado correctamente."
+    sudo systemctl status isc-dhcp-server --no-pager
+    echo
     read -p "Presiona Enter para regresar al menu..."
 }
 
@@ -199,13 +224,12 @@ function Monitorear_Clientes() {
     echo "=== CLIENTES DHCP CONECTADOS (LINUX) ==="
     echo
 
-    if ! command -v dhcp-lease-list >/dev/null 2>&1; then
-        echo "[+] Instalando herramientas de monitoreo DHCP..."
-        sudo apt update -y >/dev/null 2>&1
-        sudo apt install isc-dhcp-server -y >/dev/null 2>&1
+    if [[ ! -f /var/lib/dhcp/dhcpd.leases ]]; then
+        echo "No hay clientes conectados o archivo de leases no existe."
+    else
+        sudo awk '/lease/ {ip=$2} /hardware ethernet/ {mac=$3} /client-hostname/ {host=$2} /ends/ {print "IP: " ip ", MAC: " mac ", Host: " host}' /var/lib/dhcp/dhcpd.leases
     fi
 
-    sudo dhcp-lease-list --lease /var/lib/dhcp/dhcpd.leases
     echo
     read -p "Presiona Enter para regresar al menu..."
 }
@@ -229,17 +253,25 @@ while true; do
     echo "======================================"
     echo "       MENU DHCP SERVER LINUX"
     echo "======================================"
-    echo "1) Configurar DHCP Server"
-    echo "2) Monitorear clientes conectados"
-    echo "3) Consultar estado del servidor DHCP"
-    echo "4) Salir"
+    echo "1) Verificar instalación del DHCP Server"
+    echo "2) Instalar DHCP Server (silencioso)"
+    echo "3) Configurar DHCP Server"
+    echo "4) Iniciar / Reiniciar DHCP Server"
+    echo "5) Monitorear clientes conectados"
+    echo "6) Consultar estado del servicio DHCP"
+    echo "7) Salir"
     read -p "Selecciona una opción: " opcion
 
     case $opcion in
-        1) Configurar_DHCP ;;
-        2) Monitorear_Clientes ;;
-        3) Estado_Servicio ;;
-        4) echo "Saliendo..."; exit 0 ;;
+        1) Estado_Instalacion ;;
+        2) Instalar_Silencioso ;;
+        3) Configurar_DHCP ;;
+        4) Iniciar_DHCP ;;
+        5) Monitorear_Clientes ;;
+        6) Estado_Servicio ;;
+        7) echo "Saliendo..."; exit 0 ;;
         *) echo "Opción inválida"; sleep 1 ;;
     esac
 done
+
+
